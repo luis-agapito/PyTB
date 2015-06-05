@@ -1,0 +1,7 @@
+ &projwfc
+    prefix='silicon'
+    outdir='./'
+    filpdos='./'
+    lwrite_overlaps = .TRUE.
+    lbinary_data  = .FALSE. !we want the output in xml 
+ /
