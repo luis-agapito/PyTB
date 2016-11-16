@@ -12,13 +12,7 @@ from numpy import linalg as  la
 from functools import partial
 
 def create_kpaths(nkmesh,K):
-    '''
-    input:
-    K = list
-    nkmesh = list
-
-    returns: array 
-    '''
+    
     nKpoints = len(K)
     if len(nkmesh) != nKpoints-1: sys.exit('size of nkmesh does not agree with number of kpaths')
     list_aux = []
@@ -35,3 +29,5 @@ def linspace_vector(v1,v2,ndivs):
     ly = np.reshape(np.linspace(v1[1],v2[1],ndivs),(ndivs,1))
     lz = np.reshape(np.linspace(v1[2],v2[2],ndivs),(ndivs,1))
     return np.hstack((lx,ly,lz))
+def fname():
+    return  sys._getframe(1).f_code.co_name
