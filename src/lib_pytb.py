@@ -21,29 +21,40 @@ import lib_misc_utils as mutils
 
 
 Ry2eV   = 13.60569193
+Ha2eV   = 2*Ry2eV
 
 def build_HR_3(ineigh,neigh_indx_3d,nkpnts,kpnts,kpnts_wght,alat,a_vectors,nawf,ispin,Hk,Sk):
     
-    H = np.zeros((nawf,nawf))
-    S = np.zeros((nawf,nawf))
+    if Sk is None:
+        is_wannier=True
+    else:
+        is_wannier=False
+
+    H = np.zeros((nawf,nawf),dtype=np.complex_)
+    if not is_wannier:
+        S = np.zeros((nawf,nawf),dtype=np.complex_)
 
     R = np.dot(neigh_indx_3d[ineigh],a_vectors)
 
     for ik in range(nkpnts):
         K = 2*np.pi/alat*kpnts[ik,:]
         H = H + kpnts_wght[ik]*np.exp(-1j*np.dot(K,R))*Hk[:,:,ik,ispin]
-        S = S + kpnts_wght[ik]*np.exp(-1j*np.dot(K,R))*Sk[:,:,ik]
+        if not is_wannier:
+            S = S + kpnts_wght[ik]*np.exp(-1j*np.dot(K,R))*Sk[:,:,ik]
 
-    H = np.real(H/np.sum(kpnts_wght))
-    S = np.real(S/np.sum(kpnts_wght))
+    H = H/np.sum(kpnts_wght)
+    if is_wannier: 
+        S = None 
+    else:
+        S = S/np.sum(kpnts_wght)
 
     return H,S
-def build_HR_ser_4(nx,ny,nz,QE_xml_data_file,HR_file,Hk_file,Hk_space,nproc=1,cell_type='parallelepiped'):
+def build_HR_par_6(QE_xml_data_file,HR_file,Hk_file,Hk_space,
+                   WS_supercell_file='',nx=0,ny=0,nz=0,nproc=1):
     
 
     from multiprocessing import Pool
     fname = utils.fname() 
-
     HR_file_dir =  os.path.dirname(HR_file) 
     if not os.path.isdir(HR_file_dir): 
        print('{0:s}: Directory {1:s} does not exist. Attempting to create it'.format(fname,HR_file_dir) ) 
@@ -51,55 +62,115 @@ def build_HR_ser_4(nx,ny,nz,QE_xml_data_file,HR_file,Hk_file,Hk_space,nproc=1,ce
     if not os.path.isfile(QE_xml_data_file):
         sys.exit('{0:s}: QE_xml_data_file does not exist.'.format(fname) )
     if not os.path.isfile(Hk_file): 
-        sys.exit('{0:s}: Hk_file does not exist.'.format(fname) )
+        sys.exit('{0:s}: Hk_file/Uk_file does not exist.'.format(fname) )
 
-    Hk = np.load(Hk_file)['Hk']
-    data= np.load(QE_xml_data_file)
-    Sk = data['Sk']
-
+    if (not WS_supercell_file) and (nx*ny*nz == 0): 
+        sys.exit('{0:s}: Wrong values for nx,ny,nz'.format(fname) )
+    
+    data      = np.load(QE_xml_data_file)
     alat      = data['alat']
     a_vectors = data['a_vectors']
     nkpnts    = int(data['nkpnts'])
     nspin     = int(data['nspin'])
     kpnts     = data['kpnts']
     kpnts_wght= data['kpnts_wght']
-    nawf      = int(data['nawf'])
+   
+    Hk_space = Hk_space.lower()
+
+    if Hk_space == 'wannier':
+        Efermi = data['Efermi']  #in eV
+        is_wannier = True
+        Sk = None
+        
+        uk = np.load(Hk_file)
+        nkpnts,nbandswann,nwann = uk.shape
+
+        eigs_infile = os.path.join( os.path.dirname(Hk_file) ,'eig.npy' )
+        if not os.path.isfile(eigs_infile): sys.exit('file {0:s} not found'.format(eigs_infile))
+
+        if kpnts.shape[0] != nkpnts: sys.error('Inconsistent number of kpoints')
+        nawf = nwann
+
+
+        Ek_aux = np.load(eigs_infile) #nkpnts, nbandswann
+        nkpnts_,nbandswann_ = Ek_aux.shape
+
+        if (nbandswann_ != nbandswann) or (nkpnts_ != nkpnts) :
+            sys.exit('Inconsistent number of nbands or nkpnts ') 
+        Hk = np.zeros((nwann,nwann,nkpnts,nspin),dtype=complex)
+        if nspin > 1: sys.exit('nspin > 1 not implemented')
+        ispin = 0
+        for ik in range(nkpnts):
+            Uk = np.asmatrix(uk[ik,:,:])  #nbandswann x nwann
+            Ek = np.asmatrix(np.diag(Ek_aux[ik,:]))
+            Hk[:,:,ik,ispin] = Uk.H*Ek*Uk 
+    elif (Hk_space == 'ortho') or (Hk_space == 'nonortho'):
+        nawf_      = int(data['nawf'])
+        is_wannier = False
+        Hk = np.load(Hk_file)['Hk']
+        nawf    = Hk.shape[0]
+        if nawf != nawf_:
+            print('WARNING!!, mismatch nawf in xml is {0:d}, while nawf in Hk is {1:d}'.format(nawf_,nawf))
+        Sk = data['Sk']
+    else:
+       sys.exit('{0:s}: Value of Hk_space not recognized'.format(fname))
 
     del data
 
-    cell_type = cell_type.lower() 
+    pool      = multiprocessing.Pool(processes = nproc)
 
-    if cell_type == 'wigner-seitz':
-        r_weights,irvec = get_WS_supercell(nx,ny,nz,a_vectors)
+
+  
+    if not WS_supercell_file:
+        w_Re,irvec_Re   = get_WS_supercell(nx,ny,nz,a_vectors)
+        cell_type       = 'wigner-seitz'
     else:
-        sys.exit('build_HR_serial: invalid variable cell_type')
+        print('This is WS_supercell_file: ', WS_supercell_file)
+        sys.exit('Deprecating this option. It tended to mix up data')
+        aux       = np.load(WS_supercell_file)
+        irvec_Re  = aux['irvec']
+        w_Re      = 1.0/aux['ndegen_Re']
+        cell_type = str(aux['cell_type'])
 
-    nneighs   = len(irvec)
+    nneighs   = len(irvec_Re)
 
-    nmatrices = 2
+    if is_wannier:
+        nmatrices = 1
+    else:
+        nmatrices = 2
 
-    HR_mat = np.zeros((nspin,nneighs,nmatrices,nawf,nawf))
+    HR_mat = np.zeros((nspin,nneighs,nmatrices,nawf,nawf),dtype=np.complex_)
 
     for ispin in range(nspin):
         tic = time.time()
+        partial_build_HR= partial(build_HR_3,neigh_indx_3d=irvec_Re, \
+                                  nkpnts=nkpnts,kpnts=kpnts,kpnts_wght=kpnts_wght, \
+                                  alat=alat,a_vectors=a_vectors,nawf=nawf, \
+                                  ispin=ispin,Hk=Hk,Sk=Sk)
+
+        aux = pool.map(partial_build_HR,xrange(nneighs))
+  
+        pool.close()
+        pool.join()
+  
+
         for ir in range(nneighs):
-            Haux, Saux = build_HR_3(ir,irvec,nkpnts,kpnts,kpnts_wght, \
-                             alat,a_vectors,nawf,ispin,Hk,Sk)
+            Haux,Saux = aux[ir]
             HR_mat[ispin,ir,0,:,:] = Haux
-            HR_mat[ispin,ir,1,:,:] = Saux
+            if not is_wannier: 
+                HR_mat[ispin,ir,1,:,:] = Saux
 
         toc = time.time()
         hours, rem = divmod(toc-tic, 3600)
         minutes, seconds = divmod(rem, 60)
-        print("Processing of H[R]. Elapsed time {:0>2}:{:0>2}:{:05.2f}".format(int(hours),int(minutes),seconds))
+        print("{0:s}: Parallel processing of H[R] with {1:d} processors".format(fname,nproc))
+        print("{0:s}: Elapsed time {1:02d}:{2:02d}:{3:5.2f}".format(fname,int(hours),int(minutes),seconds))
 
-    if cell_type == 'wigner-seitz':
-        np.savez(HR_file,HR_mat=HR_mat,irvec=irvec,cell_type=cell_type,Hk_space=Hk_space,r_weights=r_weights,alat=alat,a_vectors=a_vectors,nspin=nspin)
-    else:
-        sys.exit('{0:s}: error'.format(fname))
+    np.savez(HR_file,HR_mat=HR_mat,irvec_Re=irvec_Re,cell_type=cell_type,Hk_space=Hk_space,\
+             w_Re=w_Re,alat=alat,a_vectors=a_vectors,nspin=nspin, nRe = len(w_Re), nibnds = nawf)
 
     print('{0:s}: Saving data in {1:s}'.format(fname,HR_file))
-    return HR_mat,irvec,r_weights
+    return HR_mat,irvec_Re,w_Re
 def get_WS_supercell(nk1,nk2,nk3,a_vectors):
     startt = time.time()
     nrpts = 0
@@ -162,10 +233,10 @@ def get_interpolated_bands_3(Kfrac,nkmesh,HR_mat_path,fig_erange=[-20,10]):
     """
     aux=np.load(HR_mat_path)
     HR_mat        = aux['HR_mat']
-    irvec         = aux['irvec']
+    irvec         = aux['irvec_Re']
     cell_type     = str(aux['cell_type'])
     Hk_space      = str(aux['Hk_space'])
-    r_weights     = aux['r_weights']
+    w_Re          = aux['w_Re']
     a_vectors     = aux['a_vectors']
     alat          = aux['alat']
     nspin         = aux['nspin']
@@ -181,8 +252,11 @@ def get_interpolated_bands_3(Kfrac,nkmesh,HR_mat_path,fig_erange=[-20,10]):
     nneighs    = len(irvec)
     Rarray     = np.dot(irvec,a_vectors) #a_vectors are in Bohrs
     Ek         = np.zeros((nawf,nkpath,nspin))
+
     nmatrices  = HR_mat.shape[2]
-    if Hk_space == 'ortho':
+    Hk_space = Hk_space.lower()
+
+    if (Hk_space == 'ortho') or (Hk_space == 'wannier'):
         nonortho_space= False
     elif Hk_space == 'nonortho':
         nonortho_space= True
@@ -203,8 +277,8 @@ def get_interpolated_bands_3(Kfrac,nkmesh,HR_mat_path,fig_erange=[-20,10]):
                 R   = Rarray[ineigh,:]
                 
                 
-                Hk  = Hk + r_weights[ineigh]*H*np.exp(+1j*np.dot(K,R))
-                if nonortho_space: Sk  = Sk + r_weights[ineigh]*S*np.exp(+1j*np.dot(K,R))
+                Hk  = Hk + w_Re[ineigh]*H*np.exp(+1j*np.dot(K,R))
+                if nonortho_space: Sk  = Sk + w_Re[ineigh]*S*np.exp(+1j*np.dot(K,R))
 
             Hk_hermitian = np.triu(Hk,1)+np.diag(np.diag(Hk))+np.conj(np.triu(Hk,1)).T
 
@@ -278,7 +352,7 @@ def band_plot_2(fpath,Kpath1,Ek,cell_type,Hk_space,erange=[-20,10]):
     print('band_plot_2: A figure has been saved to {0:s}'.format(pdffile))
     plt.savefig(pdffile,format='pdf')
     return
-def build_Hk_4(nawf,nkpnts,nspin,shift,eigsmat,shift_type,U,Hk_space,Hk_outfile,Sks=0,nbnds_norm=0,nbnds_in=0):
+def build_Hk_5(QE_xml_data_file,shift,shift_type,Hk_space,Hk_outfile,nbnds_norm=0,nbnds_in=0):
     """
     returns Hk:
     build_Hk_2: includes all the bands that lay under the 'shift' energy.
@@ -288,8 +362,20 @@ def build_Hk_4(nawf,nkpnts,nspin,shift,eigsmat,shift_type,U,Hk_space,Hk_outfile,
 
     build_Hk_4: -a bug for nonortho shifting is corrected: Sks was needed for that case.
                 -changed the name of the output variable from Hks to Hk.
+    build_Hk_5: reads nawf,nkpnts,nspin,shift,eigsmat, from QE_xml_data_file
     """
     nproc = 1
+
+    if not os.path.isfile(QE_xml_data_file):
+        sys.exit('File not found: {0:s}'.format(QE_xml_data_file))
+    data      = np.load(QE_xml_data_file)
+    nawf      = int(data['nawf'])
+    nkpnts    = int(data['nkpnts'])
+    nspin     = int(data['nspin'])
+    eigsmat   = data['eigsmat']
+    Sks       = data['Sk']
+    U         = data['U']
+
 
     if Hk_space.lower()=='ortho':
        del Sks 
@@ -334,7 +420,11 @@ def build_Hk_4(nawf,nkpnts,nspin,shift,eigsmat,shift_type,U,Hk_space,Hk_outfile,
                 Hks[:,:,ik,ispin] = Hks_aux  + kappa*np.identity(nawf)
             elif Hk_space.lower()=='nonortho':
                 Sk_half = sla.fractional_matrix_power(Sks[:,:,ik],0.5)
-                Hks[:,:,ik,ispin] =la.multi_dot([Sk_half,Hks_aux,Sk_half])+kappa*Sks[:,:,ik]
+                if 'multi_dot' in dir (la):
+                    Hks[:,:,ik,ispin] =la.multi_dot([Sk_half,Hks_aux,Sk_half])+kappa*Sks[:,:,ik]
+                else:
+                    Hks[:,:,ik,ispin] =np.dot(np.dot(Sk_half,Hks_aux),Sk_half)+kappa*Sks[:,:,ik]
+
             else:
                 sys.exit('wrong Hk_space option. Only ortho and nonortho are accepted')
 
@@ -348,340 +438,421 @@ def build_Hk_4(nawf,nkpnts,nspin,shift,eigsmat,shift_type,U,Hk_space,Hk_outfile,
     print("Parallel calculation of H[k] with {0:d} processors".format(nproc))
     print("Elapsed time {:0>2}:{:0>2}:{:05.2f}".format(int(hours),int(minutes),seconds))
     return Hks
-def read_all_eigenvalues_xml_values(fpath):
-    
-    b_vectors, kpnts, weights, Efermi, nspin,nbnds, root = read_QE_data_file_xml_v2(fpath)
-    return
-def read_eigenvalues_xml(ik,Efermi,nspin,ispin,root):
-    if nspin==1:
-        eigk_type=root.findall("./EIGENVALUES/K-POINT.{0:d}/EIG".format(ik+1))[0].attrib['type']
-    else:
-        eigk_type=root.findall("./EIGENVALUES/K-POINT.{0:d}/EIG.{1:d}".format(ik+1,ispin+1))[0].attrib['type']
-    if eigk_type != 'real':
-        sys.exit('Reading eigenvalues that are not real numbers')
-    if nspin==1:
-        eigk_file=np.array([float(i) for i in root.findall("./EIGENVALUES/K-POINT.{0:d}/EIG".format(ik+1))[0].text.split()])
-    else:
-        eigk_file=np.array([float(i) for i in root.findall("./EIGENVALUES/K-POINT.{0:d}/EIG.{1:d}".format(ik+1,ispin+1))[0].text.split().split()])
-    eigsmat= np.real(eigk_file)*Ry2eV-Efermi #meigs in eVs and wrt Ef
-    return eigsmat
-def read_projections_xml(ik,nawf,nbnds,nspin,ispin,root):
-    Uaux = np.zeros((nbnds,nawf),dtype=complex)
-    for iin in range(nawf): #There will be nawf projections. Each projector of size nbnds x 1
-        if nspin==1:
-            wfc_type=root.findall("./PROJECTIONS/K-POINT.{0:d}/ATMWFC.{1:d}".format(ik+1,iin+1))[0].attrib['type']
-            aux     =root.findall("./PROJECTIONS/K-POINT.{0:d}/ATMWFC.{1:d}".format(ik+1,iin+1))[0].text
-        else:
-            wfc_type=root.findall("./PROJECTIONS/K-POINT.{0:d}/SPIN.{1:d}/ATMWFC.{2:d}".format(ik+1,iin+1))[0].attrib['type']
-            aux     =root.findall("./PROJECTIONS/K-POINT.{0:d}/SPIN.{1:d}/ATMWFC.{2:d}".format(ik+1,ispin+1,iin+1))[0].text
-
-        aux = np.array([float(i) for i in re.split(',|\n',aux.strip())])
-
-        if wfc_type=='real':
-            wfc = aux.reshape((nbnds,1))#wfc = nbnds x 1
-            Uaux[:,iin] = wfc[:,0]
-        elif wfc_type=='complex':
-            wfc = aux.reshape((nbnds,2))
-            Uaux[:,iin] = wfc[:,0]+1j*wfc[:,1]
-        else:
-            sys.exit('neither real nor complex??')
-    return np.transpose(Uaux)
-def read_overlap_xml(ik,nawf,root):
-    ovlp_type = root.findall("./OVERLAPS/K-POINT.{0:d}/OVERLAP.1".format(ik+1))[0].attrib['type']
-    aux = root.findall("./OVERLAPS/K-POINT.{0:d}/OVERLAP.1".format(ik+1))[0].text
-    aux = np.array([float(i) for i in re.split(',|\n',aux.strip())])
-
-    if ovlp_type !='complex':
-        sys.exit('the overlaps are assumed to be complex numbers')
-    if len(aux) != nawf**2*2:
-        sys.exit('wrong number of elements when reading the S matrix')
-
-    aux = aux.reshape((nawf**2,2))
-    ovlp_vector = aux[:,0]+1j*aux[:,1]
-    Sks = np.reshape(ovlp_vector,(nawf,nawf),order='F')
-    Sks = np.triu(Sks,1)+np.diag(np.diag(Sks))+np.conj(np.triu(Sks,1)).T
+def read_eigenvalues_xml_par(nkpnts,Efermi,nspin,ispin,root,nproc):
+    from multiprocessing import Pool
+    pool       = multiprocessing.Pool(processes = nproc)
+    partial_read_eigenvalues = partial(read_eigenvalues_xml,Efermi=Efermi,nspin=nspin,ispin=ispin,root=root)
+    my_eigsmat = pool.map(partial_read_eigenvalues,xrange(nkpnts))
+    pool.close()
+    pool.join()
+    return my_eigsmat
+def read_projections_xml_par(nkpnts,nawf,nbnds,nspin,ispin,root,nproc):
+    from multiprocessing import Pool
+    pool       = multiprocessing.Pool(processes = nproc)
+    partial_read_projections= partial(read_projections_xml,nawf=nawf,nbnds=nbnds,nspin=nspin,ispin=ispin,root=root)
+    Uaux = pool.map(partial_read_projections,xrange(nkpnts))
+    pool.close()
+    pool.join()
+    return Uaux
+def read_overlap_xml_par(nkpnts,nawf,root,nproc):
+    from multiprocessing import Pool
+    pool       = multiprocessing.Pool(processes = nproc)
+    partial_read_overlap = partial(read_overlap_xml,nawf=nawf,root=root)
+    Sks = pool.map(partial_read_overlap,xrange(nkpnts))
+    pool.close()
+    pool.join()
     return Sks
 def read_QE_data_file_xml_v2(data_file,data_file_out=''):
- fname = utils.fname() 
+    fname = utils.fname() 
+   
+    if not os.path.isfile(data_file):
+        sys.exit('{0:s}: File {1:s} does not exist'.format(fname,data_file))
+   
+    print('{0:s}: Reading data-file.xml ...'.format(fname))
+    tree  = ET.parse(data_file)
+    root  = tree.getroot()
+   
+    alat_units  = root.findall("./CELL/LATTICE_PARAMETER")[0].attrib['UNITS']
+    alat   = float(root.findall("./CELL/LATTICE_PARAMETER")[0].text.split()[0])
+   
+   
+    a_vectors_units  = root.findall("./CELL/DIRECT_LATTICE_VECTORS/UNITS_FOR_DIRECT_LATTICE_VECTORS")[0].attrib['UNITS']
+    aux=root.findall("./CELL/DIRECT_LATTICE_VECTORS/a1")[0].text.split()
+    a1=[float(i) for i in aux]
+   
+    aux=root.findall("./CELL/DIRECT_LATTICE_VECTORS/a2")[0].text.split()
+    a2=[float(i) for i in aux]
+   
+    aux=root.findall("./CELL/DIRECT_LATTICE_VECTORS/a3")[0].text.split()
+    a3=[float(i) for i in aux]
+   
+    a_vectors = np.array([a1,a2,a3]) #in Bohrs
+    print('{0:s}: Direct lattice vectors ({1:s}):'.format(fname,a_vectors_units))
+    print(a_vectors)
+   
+    b_vectors_units   =root.findall("./CELL/RECIPROCAL_LATTICE_VECTORS/UNITS_FOR_RECIPROCAL_LATTICE_VECTORS")[0]
+    aux=root.findall("./CELL/RECIPROCAL_LATTICE_VECTORS/b1")[0].text.split()
+    b1=[float(i) for i in aux]
+   
+    aux=root.findall("./CELL/RECIPROCAL_LATTICE_VECTORS/b2")[0].text.split()
+    b2=[float(i) for i in aux]
+   
+    aux=root.findall("./CELL/RECIPROCAL_LATTICE_VECTORS/b3")[0].text.split()
+    b3=[float(i) for i in aux]
+   
+    b_vectors = np.array([b1,b2,b3]) #in Bohrs
+   
 
- if not os.path.isfile(data_file):
-     sys.exit('{0:s}: File {1:s} does not exist'.format(fname,data_file))
-
- print('{0:s}: Reading data-file.xml ...'.format(fname))
- tree  = ET.parse(data_file)
- root  = tree.getroot()
-
- alat_units  = root.findall("./CELL/LATTICE_PARAMETER")[0].attrib['UNITS']
- alat   = float(root.findall("./CELL/LATTICE_PARAMETER")[0].text.split()[0])
-
-
- a_vectors_units  = root.findall("./CELL/DIRECT_LATTICE_VECTORS/UNITS_FOR_DIRECT_LATTICE_VECTORS")[0].attrib['UNITS']
- aux=root.findall("./CELL/DIRECT_LATTICE_VECTORS/a1")[0].text.split()
- a1=[float(i) for i in aux]
-
- aux=root.findall("./CELL/DIRECT_LATTICE_VECTORS/a2")[0].text.split()
- a2=[float(i) for i in aux]
-
- aux=root.findall("./CELL/DIRECT_LATTICE_VECTORS/a3")[0].text.split()
- a3=[float(i) for i in aux]
-
- a_vectors = np.array([a1,a2,a3]) #in Bohrs
- print('{0:s}: Direct lattice vectors ({1:s}):'.format(fname,a_vectors_units))
- print(a_vectors)
-
- b_vectors_units   =root.findall("./CELL/RECIPROCAL_LATTICE_VECTORS/UNITS_FOR_RECIPROCAL_LATTICE_VECTORS")[0]
- aux=root.findall("./CELL/RECIPROCAL_LATTICE_VECTORS/b1")[0].text.split()
- b1=[float(i) for i in aux]
-
- aux=root.findall("./CELL/RECIPROCAL_LATTICE_VECTORS/b2")[0].text.split()
- b2=[float(i) for i in aux]
-
- aux=root.findall("./CELL/RECIPROCAL_LATTICE_VECTORS/b3")[0].text.split()
- b3=[float(i) for i in aux]
-
- b_vectors = np.array([b1,b2,b3]) #in Bohrs
-
- nkpnts  = int(root.findall("./BRILLOUIN_ZONE/NUMBER_OF_K-POINTS")[0].text.strip())
- kpnts   = np.zeros((nkpnts,3))
- weights = np.zeros(nkpnts)
- for ik in range(nkpnts):
-     weights[ik] = float(root.findall("./BRILLOUIN_ZONE/K-POINT.{0:d}".format(ik+1))[0].attrib['WEIGHT'])
-     aux         = root.findall("./BRILLOUIN_ZONE/K-POINT.{0:d}".format(ik+1))[0].attrib['XYZ']
-     kpnts[ik,:] = np.array([float(i) for i in aux.split()])
-
- natoms  = int(root.findall("./IONS/NUMBER_OF_ATOMS")[0].text.split()[0])
- ntype   = int(root.findall("./IONS/NUMBER_OF_SPECIES")[0].text.split()[0])
- psp_dir= root.findall("./IONS/PSEUDO_DIR")[0].text.split()[0]
-
- itype = ['None']*ntype
- ipsp  = ['None']*ntype
-
- atoms_units = root.findall("./IONS/UNITS_FOR_ATOMIC_POSITIONS")[0].attrib['UNITS']
- for i in range(ntype):
-     flabel= "./IONS/SPECIE.{0:d}/ATOM_TYPE".format(i+1)
-     itype[i]= root.findall(flabel)[0].text.split()[0]
-     flabel= "./IONS/SPECIE.{0:d}/PSEUDO".format(i+1)
-     ipsp[i] = os.path.join(psp_dir,root.findall(flabel)[0].text.split()[0])
-
- atoms_species = ['None']*natoms
- atoms_index   = ['None']*natoms
- atoms_coords  = np.zeros((natoms,3))
- for i in range(natoms):
-     flabel= "./IONS/ATOM.{0:d}".format(i+1)
-     atoms_species[i]= root.findall(flabel)[0].attrib['SPECIES'].split()[0]
-     atoms_index[i]  = int(root.findall(flabel)[0].attrib['INDEX'])
-     atoms_coords[i,:]  = np.array(map(float,root.findall(flabel)[0].attrib['tau'].split()))
-
-
- nr1 = int(root.findall("./PLANE_WAVES/FFT_GRID")[0].attrib['nr1'])
- nr2 = int(root.findall("./PLANE_WAVES/FFT_GRID")[0].attrib['nr2'])
- nr3 = int(root.findall("./PLANE_WAVES/FFT_GRID")[0].attrib['nr3'])
-
- if data_file_out != '':
-     print('{0:s}: Saving data-file.xml data to file {1:s}'.format(fname,data_file_out))
-     np.savez(data_file_out, 
-              alat_units=alat_units,\
-              alat=alat,\
-              a_vectors=a_vectors,\
-              a_vectors_units=a_vectors_units,\
-              b_vectors=b_vectors,\
-              b_vectors_units=b_vectors_units,\
-              kpnts=kpnts,\
-              weights=weights,\
-              itype=itype,\
-              ipsp=ipsp,\
-              atoms_units=atoms_units,\
-              atoms_species=atoms_species,\
-              atoms_index=atoms_index,\
-              atoms_coords=atoms_coords,\
-              nr1=nr1, nr2=nr2, nr3=nr3)
-
- return  {'alat_units':alat_units,\
-          'alat':alat,\
-          'a_vectors':a_vectors,\
-          'a_vectors_units':a_vectors_units,\
-          'b_vectors':b_vectors,\
-          'b_vectors_units':b_vectors_units,\
-          'kpnts':kpnts,\
-          'weights':weights,\
-          'itype':itype,\
-          'ipsp':ipsp,\
-          'atoms_units':atoms_units,\
-          'atoms_species':atoms_species,\
-          'atoms_index':atoms_index,\
-          'atoms_coords':atoms_coords,\
-          'nr1':nr1, 'nr2':nr2, 'nr3':nr3}
-def read_QE_output_xml_ser_v3(data_file,atomic_proj,QE_xml_data_file,read_eigs=True, read_U=False, read_S=False, nproc=1):
- 
- fname = utils.fname() 
-
- if not os.path.isfile(data_file):
-     sys.exit('{0:s}: File {1:s} does not exist'.format(fname,data_file))
- if not os.path.isfile(atomic_proj):
-     sys.exit('{0:s}: File {1:s} does not exist'.format(fname,atomic_proj))
-
- QE_xml_data_dir = os.path.dirname(QE_xml_data_file)
- if not os.path.isdir(QE_xml_data_dir):
-     print('{0:s}: Ouput directory {1:s} does not exist.'
-           ' Attempting to create it.'.format(fname,QE_xml_data_dir))
-     os.makedirs(QE_xml_data_dir)
-
- aux         = read_QE_data_file_xml_v2(data_file)
- alat_units  = aux['alat_units']
- alat        = aux['alat']
- a_vectors_units   = aux['a_vectors_units']
- a_vectors   = aux['a_vectors']
-
- print('Reading atomic_proj.xml ...')
- tree  = ET.parse(atomic_proj)
- root  = tree.getroot()
-
- nkpnts = int(root.findall("./HEADER/NUMBER_OF_K-POINTS")[0].text.strip())
- print('Number of kpoints: {0:d}'.format(nkpnts))
-
- nspin  = int(root.findall("./HEADER/NUMBER_OF_SPIN_COMPONENTS")[0].text.split()[0])
- print('Number of spin components: {0:d}'.format(nspin))
-
- kunits = root.findall("./HEADER/UNITS_FOR_K-POINTS")[0].attrib['UNITS']
- print('Units for the kpoints: {0:s}'.format(kunits))
-
- aux = root.findall("./K-POINTS")[0].text.split()
- kpnts  = np.array([float(i) for i in aux]).reshape((nkpnts,3))
- print('Read the kpoints')
-
- aux = root.findall("./WEIGHT_OF_K-POINTS")[0].text.split()
- kpnts_wght  = np.array([float(i) for i in aux])
-
- if kpnts_wght.shape[0] != nkpnts:
- 	sys.exit('Error in size of the kpnts_wght vector')
- else:
- 	print('Read the weight of the kpoints')
-
-
- nbnds  = int(root.findall("./HEADER/NUMBER_OF_BANDS")[0].text.split()[0])
- print('Number of bands: {0:d}'.format(nbnds))
-
- aux    = root.findall("./HEADER/UNITS_FOR_ENERGY")[0].attrib['UNITS']
- print('The unit for energy are {0:s}'.format(aux))
-
-
- Efermi_units    = root.findall("./HEADER/UNITS_FOR_ENERGY")[0].attrib['UNITS']
-
- if Efermi_units=='Rydberg':
-    Efermi_units='eV'
- else:
-    sys.error('Energy units has to be in Rydbers')
-
- Efermi = float(root.findall("./HEADER/FERMI_ENERGY")[0].text.split()[0])*Ry2eV
- print('Fermi energy: {0:f} eV (only if the above is Rydberg)'.format(Efermi))
-
- nawf   =int(root.findall("./HEADER/NUMBER_OF_ATOMIC_WFC")[0].text.split()[0])
- print('Number of atomic wavefunctions: {0:d}'.format(nawf))
-
- U=None
- Sks=None
- my_eigsmat = None
-
- if read_eigs: 
-    print('Reading eigenvalues') 
-    my_eigsmat = np.zeros((nbnds,nkpnts,nspin))
-    if nproc > 1:
-       parallel   = True
-    elif nproc == 1:
-       parallel   = False
+    nspin=  int (root.findall("./BAND_STRUCTURE_INFO/NUMBER_OF_SPIN_COMPONENTS")[0].text.strip() )
+    nbnds=  int (root.findall("./BAND_STRUCTURE_INFO/NUMBER_OF_BANDS")[0].text.strip() )
+    Efermi= float(root.findall("./BAND_STRUCTURE_INFO/FERMI_ENERGY")[0].text.strip() )
+    Efermi_units= root.findall("./BAND_STRUCTURE_INFO/UNITS_FOR_ENERGIES")[0].attrib['UNITS']
+    if Efermi_units=='Hartree':
+       Efermi_units='eV'
+       Efermi = Efermi*Ha2eV
     else:
-        sys.exit('Wrong number of processors')
+       sys.error('Energy units has to be in Hartree')
 
 
-    if parallel == True:
-        sys.exit('option not implemented')
+    nkpnts  = int(root.findall("./BRILLOUIN_ZONE/NUMBER_OF_K-POINTS")[0].text.strip())
+    kpnts   = np.zeros((nkpnts,3))
+    weights = np.zeros(nkpnts)
+    for ik in range(nkpnts):
+        weights[ik] = float(root.findall("./BRILLOUIN_ZONE/K-POINT.{0:d}".format(ik+1))[0].attrib['WEIGHT'])
+        aux         = root.findall("./BRILLOUIN_ZONE/K-POINT.{0:d}".format(ik+1))[0].attrib['XYZ']
+        kpnts[ik,:] = np.array([float(i) for i in aux.split()])
+  
+    nsym     = int(root.findall("./SYMMETRIES/NUMBER_OF_SYMMETRIES")[0].text.split()[0])
+    nrot     = int(root.findall("./SYMMETRIES/NUMBER_OF_BRAVAIS_SYMMETRIES")[0].text.split()[0])
+    aux      = root.findall("./SYMMETRIES/INVERSION_SYMMETRY")[0].text.split()[0]
+    invsym   = aux in ['T'] #QE output
+    aux      = root.findall("./SYMMETRIES/DO_NOT_USE_TIME_REVERSAL")[0].text.split()[0]
+    noinv    = aux in ['T'] #QE input
+    aux      = root.findall("./SYMMETRIES/TIME_REVERSAL_FLAG")[0].text.split()[0]
+    time_reversal = aux in ['T'] #QE output
+    units_for_symmetries = root.findall("./SYMMETRIES/UNITS_FOR_SYMMETRIES")[0].attrib['UNITS']
+    aux      = root.findall("./SYMMETRIES/NO_TIME_REV_OPERATIONS")[0].text.split()[0]
+    no_t_rev = aux in ['T'] #QE input
+    symop    = np.zeros((nrot,3,3), dtype=np.int)
 
+    units_for_symmetries = root.findall("./SYMMETRIES/UNITS_FOR_SYMMETRIES")[0].attrib['UNITS']
+
+    for irot in range(nrot):
+        aux = root.findall("./SYMMETRIES/SYMM.{0:d}/ROTATION".format(irot+1))[0].text
+        symop[irot, ... ] = np.transpose(np.reshape(np.fromstring(aux,dtype='int',sep='\n'),(3,3)))
+
+    natoms  = int(root.findall("./IONS/NUMBER_OF_ATOMS")[0].text.split()[0])
+    ntype   = int(root.findall("./IONS/NUMBER_OF_SPECIES")[0].text.split()[0])
+    psp_dir= root.findall("./IONS/PSEUDO_DIR")[0].text.split()[0]
+   
+    itype = ['None']*ntype
+    ipsp  = ['None']*ntype
+   
+    atoms_units = root.findall("./IONS/UNITS_FOR_ATOMIC_POSITIONS")[0].attrib['UNITS']
+    for i in range(ntype):
+        flabel= "./IONS/SPECIE.{0:d}/ATOM_TYPE".format(i+1)
+        itype[i]= root.findall(flabel)[0].text.split()[0]
+        flabel= "./IONS/SPECIE.{0:d}/PSEUDO".format(i+1)
+        ipsp[i] = os.path.join(psp_dir,root.findall(flabel)[0].text.split()[0])
+   
+    atoms_species = ['None']*natoms
+    atoms_index   = ['None']*natoms
+    atoms_coords  = np.zeros((natoms,3))
+    for i in range(natoms):
+        flabel= "./IONS/ATOM.{0:d}".format(i+1)
+        atoms_species[i]= root.findall(flabel)[0].attrib['SPECIES'].split()[0]
+        atoms_index[i]  = int(root.findall(flabel)[0].attrib['INDEX'])
+        atoms_coords[i,:]  = np.array(map(float,root.findall(flabel)[0].attrib['tau'].split()))
+   
+   
+    nr1 = int(root.findall("./PLANE_WAVES/FFT_GRID")[0].attrib['nr1'])
+    nr2 = int(root.findall("./PLANE_WAVES/FFT_GRID")[0].attrib['nr2'])
+    nr3 = int(root.findall("./PLANE_WAVES/FFT_GRID")[0].attrib['nr3'])
+   
+    if data_file_out != '':
+        print('{0:s}: Saving data-file.xml data to file {1:s}'.format(fname,data_file_out))
+        np.savez(data_file_out, 
+                 alat_units=alat_units,\
+                 alat=alat,\
+                 a_vectors=a_vectors,\
+                 a_vectors_units=a_vectors_units,\
+                 b_vectors=b_vectors,\
+                 b_vectors_units=b_vectors_units,\
+                 kpnts=kpnts,\
+                 weights=weights,\
+                 itype=itype,\
+                 ipsp=ipsp,\
+                 atoms_units=atoms_units,\
+                 atoms_species=atoms_species,\
+                 atoms_index=atoms_index,\
+                 atoms_coords=atoms_coords,\
+                 nr1=nr1, nr2=nr2, nr3=nr3,\
+                 Efermi=Efermi, Efermi_units=Efermi_units,\
+                 nbnds=nbnds,nkpnts=nkpnts,kpnts_wght=weights,nspin=nspin,\
+                 nrot=nrot, nsym=nsym, invsym=invsym, symop=symop) #sym
+   
+    return  {'alat_units':alat_units,\
+             'alat':alat,\
+             'a_vectors':a_vectors,\
+             'a_vectors_units':a_vectors_units,\
+             'b_vectors':b_vectors,\
+             'b_vectors_units':b_vectors_units,\
+             'kpnts':kpnts,\
+             'weights':weights,\
+             'itype':itype,\
+             'ipsp':ipsp,\
+             'atoms_units':atoms_units,\
+             'atoms_species':atoms_species,\
+             'atoms_index':atoms_index,\
+             'atoms_coords':atoms_coords,\
+             'nr1':nr1, 'nr2':nr2, 'nr3':nr3,\
+             'Efermi':Efermi, 'Efermi_units':Efermi_units,\
+             'nbnds':nbnds, 'nkpnts':nkpnts, 'kpnts_wght':weights, 'nspin':nspin,\
+             'nrot':nrot, 'nsym':nsym, 'invsym':invsym, 'symop':symop} #sym
+def read_QE_output_xml_v4(data_file,QE_xml_data_file,atomic_proj='',read_eigs=True, read_U=False, read_S=False, nproc=1):
+    
+
+    fname = utils.fname() 
+   
+    if atomic_proj :
+        read_atomic_proj = True
     else:
-        for ispin in range(nspin):
-          for ik in range(nkpnts):
-            if nspin==1:
-                eigk_type=root.findall("./EIGENVALUES/K-POINT.{0:d}/EIG".format(ik+1))[0].attrib['type']
-            else:
-                eigk_type=root.findall("./EIGENVALUES/K-POINT.{0:d}/EIG.{1:d}".format(ik+1,ispin+1))[0].attrib['type']
-            if eigk_type != 'real':
-              sys.exit('Reading eigenvalues that are not real numbers')
-            if nspin==1:
-              eigk_file=np.array([float(i) for i in root.findall("./EIGENVALUES/K-POINT.{0:d}/EIG".format(ik+1))[0].text.split()])
-            else:
-              eigk_file=np.array([float(i) for i in root.findall("./EIGENVALUES/K-POINT.{0:d}/EIG.{1:d}".format(ik+1,ispin+1))[0].text.split().split()])
-            my_eigsmat[:,ik,ispin] = np.real(eigk_file)*Ry2eV-Efermi #meigs in eVs and wrt Ef
+        read_atomic_proj = False
+
+        
+    if not os.path.isfile(data_file):
+        sys.exit('{0:s}: File {1:s} does not exist'.format(fname,data_file))
+
+    if read_atomic_proj and (not os.path.isfile(atomic_proj)):
+        sys.exit('{0:s}: File {1:s} does not exist'.format(fname,atomic_proj))
+   
+    QE_xml_data_dir = os.path.dirname(QE_xml_data_file)
+    if not os.path.isdir(QE_xml_data_dir):
+        print('{0:s}: Ouput directory {1:s} does not exist.'
+              ' Attempting to create it.'.format(fname,QE_xml_data_dir))
+        os.makedirs(QE_xml_data_dir)
+   
+    aux         = read_QE_data_file_xml_v2(data_file)
+    alat_units  = aux['alat_units']
+    alat        = aux['alat']
+    a_vectors_units   = aux['a_vectors_units']
+    a_vectors   = aux['a_vectors']
+    nrot        = aux['nrot']   #sym
+    nsym        = aux['nsym']   
+    invsym      = aux['invsym'] 
+    symop       = aux['symop'] 
+
+    if not read_atomic_proj: 
+        kpnts      = aux['kpnts']
+        kpnts_wght = aux['weights']
+        nkpnts     = int(aux['nkpnts'])
+        nspin      = int(aux['nspin'])
+        nbnds      = int(aux['nbnds'])
+        Efermi     = float(aux['Efermi'])
+        Efermi_units= aux['Efermi_units']
+        nawf       = 0
+        np.savez(QE_xml_data_file, nawf=nawf, \
+                 alat_units=alat_units, alat=alat, a_vectors_units=a_vectors_units, a_vectors=a_vectors, \
+                 nkpnts=nkpnts, nspin=nspin, kpnts=kpnts, kpnts_wght=kpnts_wght, \
+                 nbnds=nbnds, Efermi=Efermi, Efermi_units=Efermi_units,\
+                 nrot=nrot, nsym=nsym, invsym=invsym, symop=symop)
+        return
 
 
- if read_U:
-    print('Reading projections')
-    Uaux    = np.zeros((nbnds,nawf, nkpnts,nspin),dtype=complex)
-    U       = np.zeros((nawf, nbnds,nkpnts,nspin),dtype=complex)
-    if nproc > 1:
-       parallel   = True
-    elif nproc == 1:
-       parallel   = False
+    print('Reading atomic_proj.xml ...')
+    tree  = ET.parse(atomic_proj)
+    root  = tree.getroot()
+   
+    nkpnts = int(root.findall("./HEADER/NUMBER_OF_K-POINTS")[0].text.strip())
+    print('Number of kpoints: {0:d}'.format(nkpnts))
+   
+    nspin  = int(root.findall("./HEADER/NUMBER_OF_SPIN_COMPONENTS")[0].text.split()[0])
+    print('Number of spin components: {0:d}'.format(nspin))
+   
+    kunits = root.findall("./HEADER/UNITS_FOR_K-POINTS")[0].attrib['UNITS']
+    print('Units for the kpoints: {0:s}'.format(kunits))
+   
+    aux = root.findall("./K-POINTS")[0].text.split()
+    kpnts  = np.array([float(i) for i in aux]).reshape((nkpnts,3))
+    print('Read the kpoints')
+   
+    aux = root.findall("./WEIGHT_OF_K-POINTS")[0].text.split()
+    kpnts_wght  = np.array([float(i) for i in aux])
+   
+    if kpnts_wght.shape[0] != nkpnts:
+    	sys.exit('Error in size of the kpnts_wght vector')
     else:
-        sys.exit('Wrong number of processors')
-
-    if parallel == True:
-       sys.exit('option not implemented')
+    	print('Read the weight of the kpoints')
+   
+   
+    nbnds  = int(root.findall("./HEADER/NUMBER_OF_BANDS")[0].text.split()[0])
+    print('Number of bands: {0:d}'.format(nbnds))
+   
+    Efermi_units    = root.findall("./HEADER/UNITS_FOR_ENERGY")[0].attrib['UNITS']
+   
+    if Efermi_units=='Rydberg':
+       Efermi_units='eV'
     else:
-        for ispin in range(nspin):
-          for ik in range(nkpnts):
-            for iin in range(nawf): #There will be nawf projections. Each projector of size nbnds x 1
-              if nspin==1:
-                wfc_type=root.findall("./PROJECTIONS/K-POINT.{0:d}/ATMWFC.{1:d}".format(ik+1,iin+1))[0].attrib['type']
-                aux     =root.findall("./PROJECTIONS/K-POINT.{0:d}/ATMWFC.{1:d}".format(ik+1,iin+1))[0].text
-              else:
-                wfc_type=root.findall("./PROJECTIONS/K-POINT.{0:d}/SPIN.{1:d}/ATMWFC.{2:d}".format(ik+1,iin+1))[0].attrib['type']
-                aux     =root.findall("./PROJECTIONS/K-POINT.{0:d}/SPIN.{1:d}/ATMWFC.{2:d}".format(ik+1,ispin+1,iin+1))[0].text
-
-              aux = np.array([float(i) for i in re.split(',|\n',aux.strip())])
-
-              if wfc_type=='real':
-                wfc = aux.reshape((nbnds,1))#wfc = nbnds x 1
-                Uaux[:,iin,ik,ispin] = wfc[:,0]
-              elif wfc_type=='complex':
-                wfc = aux.reshape((nbnds,2))
-                Uaux[:,iin,ik,ispin] = wfc[:,0]+1j*wfc[:,1]
-              else:
-                sys.exit('neither real nor complex??')
-
-        for ispin in range(nspin):
-          for ik in range(nkpnts):
-            U[:,:,ik,ispin] = np.transpose(Uaux[:,:,ik,ispin]) #transpose of U. Now the columns of UU are the eigenvector of length nawf
-
-    test = np.isnan(U)
-    if True in test:
-      sys.exit('Found a NaN projection coefficient. Crashing ...')
-
- if read_S:
-     print('Reading overlap matrix')
-     Sks  = np.zeros((nawf,nawf,nkpnts),dtype=complex)
-     if parallel == True:
-        sys.exit('option not implemented')
-     else:
-        for ik in range(nkpnts):
-          ovlp_type = root.findall("./OVERLAPS/K-POINT.{0:d}/OVERLAP.1".format(ik+1))[0].attrib['type']
-          aux = root.findall("./OVERLAPS/K-POINT.{0:d}/OVERLAP.1".format(ik+1))[0].text
-          aux = np.array([float(i) for i in re.split(',|\n',aux.strip())])
-
-          if ovlp_type !='complex':
-            sys.exit('the overlaps are assumed to be complex numbers')
-          if len(aux) != nawf**2*2:
-            sys.exit('wrong number of elements when reading the S matrix')
-
-          aux = aux.reshape((nawf**2,2))
-          ovlp_vector = aux[:,0]+1j*aux[:,1]
-          Sks_aux  = ovlp_vector.reshape((nawf,nawf),order='F')
-          Sks[:,:,ik] = np.triu(Sks_aux,1)+np.diag(np.diag(Sks_aux))+np.conj(np.triu(Sks_aux,1)).T
-
- np.savez(QE_xml_data_file, \
-          U=U, Sk=Sks, eigsmat=my_eigsmat, alat_units=alat_units, alat=alat, a_vectors_units=a_vectors_units, a_vectors=a_vectors, \
-          nkpnts=nkpnts, nspin=nspin, kpnts=kpnts, kpnts_wght=kpnts_wght, \
-          nbnds=nbnds, Efermi=Efermi, Efermi_units=Efermi_units, nawf=nawf)
- return(U,Sks, my_eigsmat, alat_units, alat, a_vectors_units, a_vectors, nkpnts, nspin,\
-        kpnts, kpnts_wght, nbnds, Efermi, Efermi_units,nawf)
+       sys.error('Energy units has to be in Rydbers')
+   
+    Efermi = float(root.findall("./HEADER/FERMI_ENERGY")[0].text.split()[0])*Ry2eV
+   
+    print('Fermi energy: {0:f} (eV)'.format(Efermi))
+   
+    nawf   =int(root.findall("./HEADER/NUMBER_OF_ATOMIC_WFC")[0].text.split()[0])
+    print('Number of atomic wavefunctions: {0:d}'.format(nawf))
+   
+    U=None
+    Sks=None
+    my_eigsmat = None
+   
+    if read_eigs: 
+       print('Reading eigenvalues with {0:d} processors'.format(nproc))
+       my_eigsmat = np.zeros((nbnds,nkpnts,nspin))
+       if nproc > 1:
+          parallel   = True
+       elif nproc == 1:
+          parallel   = False
+       else:
+           sys.exit('Wrong number of processors')
+   
+   
+       if parallel == True:
+           for ispin in range(nspin):
+               tic = time.time()
+               my_eigsmat_list=read_eigenvalues_xml_par(nkpnts,Efermi,nspin,ispin,root,nproc)
+   
+               toc = time.time()
+               hours, rem = divmod(toc-tic, 3600)
+               minutes, seconds = divmod(rem, 60)
+               print("Parallel parsing of eigenvalues[k] {:0>2}:{:0>2}:{:05.2f}".format(int(hours),int(minutes),seconds))
+   
+               tic = time.time()
+               for ik in range(nkpnts):
+                   my_eigsmat[:,ik,ispin]=my_eigsmat_list[ik]
+               toc = time.time()
+               hours, rem = divmod(toc-tic, 3600)
+               minutes, seconds = divmod(rem, 60)
+               print("Converting eigevalues[k] from lists to matrix {:0>2}:{:0>2}:{:05.2f}".format(int(hours),int(minutes),seconds))
+   
+   
+       else:
+           for ispin in range(nspin):
+             for ik in range(nkpnts):
+               if nspin==1:
+                   eigk_type=root.findall("./EIGENVALUES/K-POINT.{0:d}/EIG".format(ik+1))[0].attrib['type']
+               else:
+                   eigk_type=root.findall("./EIGENVALUES/K-POINT.{0:d}/EIG.{1:d}".format(ik+1,ispin+1))[0].attrib['type']
+               if eigk_type != 'real':
+                 sys.exit('Reading eigenvalues that are not real numbers')
+               if nspin==1:
+                 eigk_file=np.array([float(i) for i in root.findall("./EIGENVALUES/K-POINT.{0:d}/EIG".format(ik+1))[0].text.split()])
+               else:
+                 eigk_file=np.array([float(i) for i in root.findall("./EIGENVALUES/K-POINT.{0:d}/EIG.{1:d}".format(ik+1,ispin+1))[0].text.split().split()])
+               my_eigsmat[:,ik,ispin] = np.real(eigk_file)*Ry2eV-Efermi #meigs in eVs and wrt Ef
+   
+   
+    if read_U:
+       print('Reading projections with {0:d} processors'.format(nproc))
+       Uaux    = np.zeros((nbnds,nawf, nkpnts,nspin),dtype=complex)
+       U       = np.zeros((nawf, nbnds,nkpnts,nspin),dtype=complex)
+       if nproc > 1:
+          parallel   = True
+       elif nproc == 1:
+          parallel   = False
+       else:
+           sys.exit('Wrong number of processors')
+   
+       if parallel == True:
+           for ispin in range(nspin):
+               tic = time.time()
+               Uaux_list      =read_projections_xml_par(nkpnts,nawf,nbnds,nspin,ispin,root,nproc)
+               toc = time.time()
+               hours, rem = divmod(toc-tic, 3600)
+               minutes, seconds = divmod(rem, 60)
+               print("Parallel parsing of U[k] {:0>2}:{:0>2}:{:05.2f}".format(int(hours),int(minutes),seconds))
+   
+               tic = time.time()
+               for ik in range(nkpnts):
+                   U[:,:,ik,ispin] = Uaux_list[ik]
+               toc = time.time()
+               hours, rem = divmod(toc-tic, 3600)
+               minutes, seconds = divmod(rem, 60)
+               print("Converting U[k] from lists to matrix {:0>2}:{:0>2}:{:05.2f}".format(int(hours),int(minutes),seconds))
+   
+   
+       else:
+           for ispin in range(nspin):
+             for ik in range(nkpnts):
+               for iin in range(nawf): #There will be nawf projections. Each projector of size nbnds x 1
+                 if nspin==1:
+                   wfc_type=root.findall("./PROJECTIONS/K-POINT.{0:d}/ATMWFC.{1:d}".format(ik+1,iin+1))[0].attrib['type']
+                   aux     =root.findall("./PROJECTIONS/K-POINT.{0:d}/ATMWFC.{1:d}".format(ik+1,iin+1))[0].text
+                 else:
+                   wfc_type=root.findall("./PROJECTIONS/K-POINT.{0:d}/SPIN.{1:d}/ATMWFC.{2:d}".format(ik+1,iin+1))[0].attrib['type']
+                   aux     =root.findall("./PROJECTIONS/K-POINT.{0:d}/SPIN.{1:d}/ATMWFC.{2:d}".format(ik+1,ispin+1,iin+1))[0].text
+   
+                 aux = np.array([float(i) for i in re.split(',|\n',aux.strip())])
+   
+                 if wfc_type=='real':
+                   wfc = aux.reshape((nbnds,1))#wfc = nbnds x 1
+                   Uaux[:,iin,ik,ispin] = wfc[:,0]
+                 elif wfc_type=='complex':
+                   wfc = aux.reshape((nbnds,2))
+                   Uaux[:,iin,ik,ispin] = wfc[:,0]+1j*wfc[:,1]
+                 else:
+                   sys.exit('neither real nor complex??')
+   
+           for ispin in range(nspin):
+             for ik in range(nkpnts):
+               U[:,:,ik,ispin] = np.transpose(Uaux[:,:,ik,ispin]) #transpose of U. Now the columns of UU are the eigenvector of length nawf
+   
+       test = np.isnan(U)
+       if True in test:
+         sys.exit('Found a NaN projection coefficient. Crashing ...')
+   
+    if read_S:
+        print('Reading overlap matrix')
+        Sks  = np.zeros((nawf,nawf,nkpnts),dtype=complex)
+        if parallel == True:
+           tic = time.time()
+           Sks_list = read_overlap_xml_par(nkpnts,nawf,root,nproc)
+           toc = time.time()
+           hours, rem = divmod(toc-tic, 3600)
+           minutes, seconds = divmod(rem, 60)
+           print("Parallel parsing of S[k] {:0>2}:{:0>2}:{:05.2f}".format(int(hours),int(minutes),seconds))
+   
+           tic = time.time()
+           for ik in range(nkpnts):
+               Sks[:,:,ik] = Sks_list[ik]
+           toc = time.time()
+           hours, rem = divmod(toc-tic, 3600)
+           minutes, seconds = divmod(rem, 60)
+           print("Converting S[k] list to matrix {:0>2}:{:0>2}:{:05.2f}".format(int(hours),int(minutes),seconds))
+        else:
+           for ik in range(nkpnts):
+             ovlp_type = root.findall("./OVERLAPS/K-POINT.{0:d}/OVERLAP.1".format(ik+1))[0].attrib['type']
+             aux = root.findall("./OVERLAPS/K-POINT.{0:d}/OVERLAP.1".format(ik+1))[0].text
+             aux = np.array([float(i) for i in re.split(',|\n',aux.strip())])
+   
+             if ovlp_type !='complex':
+               sys.exit('the overlaps are assumed to be complex numbers')
+             if len(aux) != nawf**2*2:
+               sys.exit('wrong number of elements when reading the S matrix')
+   
+             aux = aux.reshape((nawf**2,2))
+             ovlp_vector = aux[:,0]+1j*aux[:,1]
+             Sks_aux  = ovlp_vector.reshape((nawf,nawf),order='F')
+             Sks[:,:,ik] = np.triu(Sks_aux,1)+np.diag(np.diag(Sks_aux))+np.conj(np.triu(Sks_aux,1)).T
+  
+    np.savez(QE_xml_data_file, \
+             U=U, Sk=Sks, eigsmat=my_eigsmat, alat_units=alat_units, alat=alat, a_vectors_units=a_vectors_units, a_vectors=a_vectors, \
+             nkpnts=nkpnts, nspin=nspin, kpnts=kpnts, kpnts_wght=kpnts_wght, \
+             nbnds=nbnds, Efermi=Efermi, Efermi_units=Efermi_units, nawf=nawf, \
+             nrot=nrot, nsym=nsym, invsym=invsym, symop=symop) #sym
+    return(U,Sks, my_eigsmat, alat_units, alat, a_vectors_units, a_vectors, nkpnts, nspin,\
+        kpnts, kpnts_wght, nbnds, Efermi, Efermi_units,nawf, \
+        nrot, nsym, invsym, symop) #sym
 def plot_compare_TB_DFT_eigs(Hks,my_eigsmat):
     import matplotlib.pyplot as plt
     import os

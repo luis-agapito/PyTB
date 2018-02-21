@@ -3,7 +3,7 @@ Ab-initio Tight Binding Hamiltonians
 
 ```bash
 cd docs/test/
-python get_interpolated_bands_nonortho.py
+python test_v2.1.py
 gnuplot --persist plot.gnu
 ```
 

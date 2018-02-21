@@ -22,7 +22,6 @@ def read_gnuplot_data(filename,sep_str='\n \n'):
       bands[i] = np.loadtxt(StringIO(text[i]))
 
   fid.close()
-  print('test')
 
 
 
