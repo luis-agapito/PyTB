@@ -186,3 +186,50 @@ def read_UPF(fullpath):
        pickle.dump(psp,fp)
    
     sio.savemat(fullpath + '.mat',psp)
+def write_formatted_chi_2(upf_full_filename,outdir,ralpha=None,do_norm=None):
+
+    psp = read_UPF(upf_full_filename)
+
+    outfile = os.path.join(outdir,'PP_CHI.xml')
+    print('Printing formatted PP CHI to: {0:s}'.format(outfile))
+    fid     = open(outfile,"w")
+
+    occ_str = eformat(0,15,3) #the occupation can be left as 0
+    natwfc  = psp['PP_FULL_WFC']['number_of_wfc']
+    radials = psp['PP_FULL_WFC']['PP_PSWFC']
+    labels  = psp['PP_FULL_WFC']['PP_PSWFC_label']
+    l       = psp['PP_FULL_WFC']['PP_PSWFC_l']
+    size    = psp['PP_FULL_WFC']['PP_PSWFC_size']
+    rab     = psp['PP_MESH']['PP_RAB']
+    r       = psp['PP_MESH']['PP_R']
+
+    pseudo_e_str = eformat(0,15,3) #the pseudo energy can be left as 0
+
+    if ralpha is not None:
+       if (len(ralpha) != natwfc):
+          sys.exit('Number of scaling parameters do not match number of wfcs')
+       for ichi in range(natwfc):
+           print('scaling wfc %d by exp(-%f *r)'%(ichi,ralpha[ichi]))
+           radials[:,ichi] = radials[:,ichi]*np.exp(-ralpha[ichi]*r)
+
+    if do_norm is not None:
+       if (len(do_norm) != natwfc):
+          sys.exit('Number of normalization flags do not match number of wfcs')
+       for ichi in range(natwfc):
+           if do_norm[ichi]:
+               norm_factor = 1/np.sqrt(sum(radials[:,ichi]**2*rab))
+               print('Normalizing wfc %d to 1. Initial normalization was %f'%(ichi,1/norm_factor))
+               radials[:,ichi] = radials[:,ichi]*norm_factor      
+
+    for ichi in range(natwfc):
+        print('    <PP_CHI.{0:d} type="real" size="{1:d}"'
+              ' columns="4" index="{2:d}" label="{3:s}"'
+              ' l="{4:d}" occupation="{5:s}" n="{6:d}"\npseudo_energy="{7:s}">'.
+              format(ichi+1,size,ichi+1,labels[ichi],l[ichi],occ_str,l[ichi]+1,pseudo_e_str),file=fid)
+        chi_str= radial2string(radials[:,ichi])
+        print('{0:s}'.format(chi_str),file=fid)
+        print('    </PP_CHI.{0:d}>'.format(ichi+1),file=fid)
+
+    fid.close()
+
+    return radials
