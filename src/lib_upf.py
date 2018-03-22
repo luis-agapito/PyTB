@@ -233,3 +233,19 @@ def write_formatted_chi_2(upf_full_filename,outdir,ralpha=None,do_norm=None):
     fid.close()
 
     return radials
+def eformat(f, prec, exp_digits):
+    s = "%+.*e"%(prec, f)
+    mantissa, exp = s.split('e')
+    mantissa1=mantissa.replace('+',' ')
+    return "%sE%+0*d"%(mantissa1, exp_digits+1, int(exp))
+def radial2string(chi):
+    longstr =""
+    for ii,x in enumerate(chi):
+        nstr = eformat(x,15,3)
+        if (ii+1) == chi.size:
+            longstr = longstr+nstr
+        elif (ii+1)%4 == 0:
+            longstr = longstr+nstr+"\n"
+        else:
+            longstr = longstr+nstr+" "
+    return longstr
